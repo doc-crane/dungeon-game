@@ -26,6 +26,12 @@ const NOVA_CD        = 2;
 const BAG_SIZE       = 20;    // inventory slots
 const DROP_CHANCE    = 0.28;  // chance a monster drops gear (0 to 1)
 const MONSTER_GROWTH = 0.28;  // how much tougher monsters get each level
+const BASE_LIGHT      = 270;   // how far your torch lights things up (bigger = easier to see)
+const LIGHT_DEPTH_LOSS = 0.03; // the dungeon gets darker by this much each level (0 = never)
+const DARKNESS        = 0.96;  // how black the dark is (1 = pitch black)
+const MUSIC_FILE      = 'wooden_boy.mp3';  // the soundtrack (keep this file in the same folder as the game)
+const MUSIC_VOLUME    = 0.5;   // 0 = silent, 1 = full volume
+const ATMOSPHERE_SOUNDS = false; // creepy drone + rumbles (turn on by changing false to true)
 
 // ---------- basic setup ----------
 const cv = document.getElementById('c');
@@ -53,10 +59,38 @@ function toWorld(sx, sy) { const a = sx / ISO_X, b = sy / ISO_Y; return { x: (a 
 function wAng(a) { return Math.atan2((Math.cos(a) + Math.sin(a)) * ISO_Y, (Math.cos(a) - Math.sin(a)) * ISO_X); }
 
 // ---------- sound (tiny synthesized beeps, no files needed) ----------
-let audio = null;
+let audio = null, muted = false, drone = null, ambTimer = 8;
+const music = new Audio(MUSIC_FILE);
+music.loop = true;
+music.volume = MUSIC_VOLUME;
+function startMusic() {
+  music.muted = muted;
+  music.play().catch(() => {        // browsers only allow music after you click, which the title screen does
+    if (music.error) say('Music file "' + MUSIC_FILE + '" was not found. Put it in the same folder as the game.');
+  });
+}
+function startDrone() {
+  if (!ATMOSPHERE_SOUNDS || drone || !audio) return;
+  const g = audio.createGain(); g.gain.value = muted ? 0 : 0.025; g.connect(audio.destination);
+  [55, 82.4, 110.7].forEach((f, i) => {
+    const o = audio.createOscillator(); o.type = i === 2 ? 'triangle' : 'sine'; o.frequency.value = f;
+    const lfo = audio.createOscillator(); lfo.frequency.value = 0.05 + i * 0.03;
+    const lg = audio.createGain(); lg.gain.value = 1.5;
+    lfo.connect(lg); lg.connect(o.frequency); o.connect(g); o.start(); lfo.start();
+  });
+  drone = g;
+}
+function toggleSound() {
+  muted = !muted;
+  if (drone) drone.gain.value = muted ? 0 : 0.025;
+  music.muted = muted;
+  if (!muted) startMusic();
+  say(muted ? 'Sound off (press M to turn it back on).' : 'Sound on.');
+}
 function sfx(freq, dur = 0.08, type = 'square', vol = 0.05, slide = 0) {
+  if (muted) return;
   try {
-    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+    if (!audio) { audio = new (window.AudioContext || window.webkitAudioContext)(); startDrone(); }
     const o = audio.createOscillator(), g = audio.createGain();
     o.type = type;
     o.frequency.setValueAtTime(freq, audio.currentTime);
@@ -70,9 +104,10 @@ function sfx(freq, dur = 0.08, type = 'square', vol = 0.05, slide = 0) {
 
 // ---------- game state ----------
 const state = { mode: 'title' };
-let p, enemies = [], drops = [], projs = [], parts = [], floats = [], msgs = [];
+let p, enemies = [], drops = [], projs = [], parts = [], floats = [], msgs = [], flashes = [];
 let map, seen, rooms, stairs, depth = 1, bossRef = null;
 let cam = { x: 0, y: 0 };
+let zoom = 1, zoomTarget = 1;   // mouse wheel zoom (0.5 = far away, 2 = up close)
 let mouse = { x: 0, y: 0, wx: 0, wy: 0, down: false };
 let invOpen = false, hoverEnemy = null, hurt = 0, deadTimer = 0, stairMsgCd = 0, time = 0;
 
@@ -95,19 +130,20 @@ const SLOT_BASES = {
 const PREFIX = ['Sharp', 'Vicious', 'Ancient', 'Gleaming', 'Brutal', 'Fine'];
 const WORD_A = ['Doom', 'Soul', 'Grim', 'Blood', 'Night', 'Storm', 'Ash', 'Ember'];
 const WORD_B = ['fang', 'bane', 'song', 'ward', 'grasp', 'heart', 'edge', 'veil'];
-const BONUS_KEYS = ['hp', 'mp', 'crit', 'steal', 'spd'];
+const BONUS_KEYS = ['hp', 'mp', 'crit', 'steal', 'spd', 'light'];
 const BONUS_TEXT = {
   hp:    n => '+' + n + ' Max Life',
   mp:    n => '+' + n + ' Max Mana',
   crit:  n => '+' + n + '% Critical Chance',
   steal: n => '+' + n + '% Life Steal',
-  spd:   n => '+' + n + '% Attack Speed'
+  spd:   n => '+' + n + '% Attack Speed',
+  light: n => '+' + n + '% Light Radius'
 };
 const RAR_COL = ['#d8d8d8', '#6ab0ff', '#ffd24a'];
 const RAR_NAME = ['Common', 'Magic', 'Rare'];
 
 function bonusVal(k, ilvl) {
-  const base = { hp: 10 + ilvl * 5, mp: 8 + ilvl * 4, crit: 3 + ilvl * 0.8, steal: 1 + ilvl * 0.35, spd: 4 + ilvl * 0.7 }[k];
+  const base = { hp: 10 + ilvl * 5, mp: 8 + ilvl * 4, crit: 3 + ilvl * 0.8, steal: 1 + ilvl * 0.35, spd: 4 + ilvl * 0.7, light: 5 + ilvl * 1.2 }[k];
   return Math.max(1, Math.round(base * rnd(0.8, 1.2)));
 }
 
@@ -234,7 +270,7 @@ function buildLevel() {
   genLevel();
   const r0 = rooms[0];
   p.x = r0.cx * T + T / 2; p.y = r0.cy * T + T / 2;
-  p.path = []; p.target = null;
+  p.path = []; p.target = null; p.vx = 0; p.vy = 0;
   const rl = rooms[rooms.length - 1];
   stairs = { x: rl.cx * T + T / 2, y: rl.cy * T + T / 2 };
   enemies = []; drops = []; projs = []; bossRef = null;
@@ -248,13 +284,14 @@ function buildLevel() {
 
 // ---------- player ----------
 function newGame() {
+  startMusic();
   depth = 1;
   p = { x: 0, y: 0, r: 12, hp: 100, maxhp: 100, mp: 50, maxmp: 50, xp: 0, lvl: 1, gold: 0, hpPots: 2, mpPots: 1,
         eq: { weapon: null, armor: null, helm: null, ring: null }, bag: [], path: [], target: null,
-        cd: 0, swing: 0, face: 0, fbCd: 0, novaCd: 0, repath: 0, dmg: 5, armor: 0, crit: 5, steal: 0, spd: 0 };
+        cd: 0, swing: 0, face: 0, vx: 0, vy: 0, mark: null, fbCd: 0, novaCd: 0, repath: 0, dmg: 5, armor: 0, crit: 5, steal: 0, spd: 0 };
   p.eq.weapon = { slot: 'weapon', rar: 0, ilvl: 1, base: 'Sword', name: 'Rusty Sword', dmg: 4, armor: 0, b: {}, val: 5 };
   recalc(); p.hp = p.maxhp; p.mp = p.maxmp;
-  msgs = []; floats = []; parts = []; projs = [];
+  msgs = []; floats = []; parts = []; projs = []; flashes = [];
   invOpen = false; hurt = 0;
   buildLevel();
   state.mode = 'play';
@@ -262,14 +299,14 @@ function newGame() {
 }
 
 function recalc() {
-  let dmg = 4 + p.lvl * 2, armor = 0, crit = 5, steal = 0, spd = 0, hp = 0, mp = 0;
+  let dmg = 4 + p.lvl * 2, armor = 0, crit = 5, steal = 0, spd = 0, hp = 0, mp = 0, light = 0;
   for (const s in p.eq) {
     const it = p.eq[s]; if (!it) continue;
     dmg += it.dmg; armor += it.armor;
     crit += it.b.crit || 0; steal += it.b.steal || 0; spd += it.b.spd || 0;
-    hp += it.b.hp || 0; mp += it.b.mp || 0;
+    hp += it.b.hp || 0; mp += it.b.mp || 0; light += it.b.light || 0;
   }
-  p.dmg = dmg; p.armor = armor; p.crit = crit; p.steal = steal; p.spd = spd;
+  p.dmg = dmg; p.armor = armor; p.crit = crit; p.steal = steal; p.spd = spd; p.light = light;
   p.maxhp = 70 + p.lvl * 15 + hp; p.maxmp = 30 + p.lvl * 8 + mp;
   p.hp = Math.min(p.hp, p.maxhp); p.mp = Math.min(p.mp, p.maxmp);
 }
@@ -374,6 +411,7 @@ function castNova() {
     const a = (i / 40) * PI2;
     parts.push({ x: p.x + Math.cos(a) * 20, y: p.y + Math.sin(a) * 20, vx: Math.cos(a) * 260, vy: Math.sin(a) * 260, life: 0.5, col: '#8fdcff', size: 4 });
   }
+  flashes.push({ x: p.x, y: p.y, life: 0.3, big: true });
   sfx(600, 0.35, 'triangle', 0.07, -400);
 }
 
@@ -395,10 +433,65 @@ function buy(kind) {
   sfx(700, 0.08, 'triangle', 0.05);
 }
 
+// Can a circle of radius r walk in a straight line from A to B without touching a wall?
+function clearLine(ax, ay, bx, by, r) {
+  const d = Math.hypot(bx - ax, by - ay), n = Math.max(1, Math.ceil(d / 8));
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    if (blocked(ax + (bx - ax) * t, ay + (by - ay) * t, r)) return false;
+  }
+  return true;
+}
+
+// Turns a zig-zag tile path into a short, straight path by cutting corners where it is safe.
+function smoothPath(sx, sy, path, r) {
+  const out = [];
+  let cx = sx, cy = sy, i = 0;
+  while (i < path.length) {
+    let j = path.length - 1;
+    while (j > i && !clearLine(cx, cy, path[j].x, path[j].y, r)) j--;
+    out.push(path[j]);
+    cx = path[j].x; cy = path[j].y; i = j + 1;
+  }
+  return out;
+}
+
 function moveTo(wx, wy) {
   const tx = Math.floor(wx / T), ty = Math.floor(wy / T);
-  const path = findPath(Math.floor(p.x / T), Math.floor(p.y / T), tx, ty);
-  p.path = path || [];
+  if (solid(tx, ty)) return;                       // clicked a wall: keep doing what we were doing
+  let gx = wx, gy = wy;
+  if (blocked(gx, gy, p.r)) { gx = tx * T + T / 2; gy = ty * T + T / 2; }   // too close to a wall
+  if (clearLine(p.x, p.y, gx, gy, p.r)) { p.path = [{ x: gx, y: gy }]; return; }   // straight shot
+  const raw = findPath(Math.floor(p.x / T), Math.floor(p.y / T), tx, ty);
+  if (!raw || !raw.length) return;
+  raw[raw.length - 1] = { x: gx, y: gy };          // end exactly where you clicked
+  p.path = smoothPath(p.x, p.y, raw, p.r);
+}
+
+// Moves the player along the path with smooth speeding up and slowing down.
+function movePlayer(dt) {
+  let dvx = 0, dvy = 0;
+  if (p.path.length) {
+    const t = p.path[0];
+    const dx = t.x - p.x, dy = t.y - p.y, d = Math.hypot(dx, dy);
+    const last = p.path.length === 1;
+    if (d < (last ? 3 : 10)) p.path.shift();
+    else {
+      let sp = PLAYER_SPEED;
+      if (last && d < 40) sp *= Math.max(0.25, d / 40);      // ease to a stop
+      dvx = dx / d * sp; dvy = dy / d * sp;
+    }
+  }
+  const k = 1 - Math.exp(-dt * 16);                // bigger number = snappier, smaller = floatier
+  p.vx += (dvx - p.vx) * k; p.vy += (dvy - p.vy) * k;
+  if (Math.hypot(p.vx, p.vy) > 1) {
+    tryMove(p, p.vx * dt, p.vy * dt);
+    if (!p.target) {                                // turn smoothly toward where we're heading
+      let da = Math.atan2(p.vy, p.vx) - p.face;
+      da = Math.atan2(Math.sin(da), Math.cos(da));
+      p.face += da * (1 - Math.exp(-dt * 18));
+    }
+  }
 }
 
 function equipItem(i) {
@@ -436,20 +529,21 @@ function follow(e, dt, spd) {
 
 // ---------- update ----------
 function updateMouse() {
-  const msx = mouse.x + Math.round(cam.x), msy = mouse.y + Math.round(cam.y);
+  const msx = (mouse.x - W / 2) / zoom + W / 2 + Math.round(cam.x), msy = (mouse.y - H / 2) / zoom + H / 2 + Math.round(cam.y);
   const w = toWorld(msx, msy);
   mouse.wx = w.x; mouse.wy = w.y;
   hoverEnemy = null;
   if (state.mode !== 'play') return;
   let best = 1e9;
   for (const e of enemies) {
-    if (e.dead || !los(p, e)) continue;
+    if (e.dead || dist(e, p) > lightRadius() * 1.05 || !los(p, e)) continue;
     const d = Math.hypot(msx - ix(e.x, e.y), msy - (iy(e.x, e.y) - e.r * 1.1));
     if (d < e.r + 10 && d < best) { best = d; hoverEnemy = e; }
   }
 }
 
 function updatePlayer(dt) {
+  if (p.mark) p.mark.life -= dt;
   p.cd -= dt; p.swing -= dt; p.fbCd -= dt; p.novaCd -= dt; p.repath -= dt;
   p.hp = Math.min(p.maxhp, p.hp + (0.5 + p.lvl * 0.2) * dt);
   p.mp = Math.min(p.maxmp, p.mp + (2 + p.lvl * 0.4) * dt);
@@ -457,7 +551,7 @@ function updatePlayer(dt) {
   const overPanel = invOpen && inPanel(mouse.x, mouse.y);
   if (mouse.down && !overPanel) {
     if (!p.target && hoverEnemy) p.target = hoverEnemy;
-    if (!p.target && p.repath <= 0) { moveTo(mouse.wx, mouse.wy); p.repath = 0.12; }
+    if (!p.target && p.repath <= 0) { moveTo(mouse.wx, mouse.wy); p.repath = 0.06; }
   }
 
   if (p.target) {
@@ -472,15 +566,13 @@ function updatePlayer(dt) {
       } else {
         if (p.repath <= 0 || !p.path.length) {
           if (d < 160 && los(p, t)) p.path = [{ x: t.x, y: t.y }];
-          else p.path = findPath(Math.floor(p.x / T), Math.floor(p.y / T), Math.floor(t.x / T), Math.floor(t.y / T)) || [];
+          else p.path = smoothPath(p.x, p.y, findPath(Math.floor(p.x / T), Math.floor(p.y / T), Math.floor(t.x / T), Math.floor(t.y / T)) || [], p.r);
           p.repath = 0.25;
         }
-        follow(p, dt, PLAYER_SPEED);
       }
     }
-  } else {
-    follow(p, dt, PLAYER_SPEED);
   }
+  movePlayer(dt);
 }
 
 function updateEnemy(e, dt) {
@@ -534,6 +626,7 @@ function explode(pr) {
   const d = pr.dmg;
   for (const e of enemies) if (!e.dead && dist(e, pr) < 60) hitEnemy(e, Math.round(d * rnd(0.9, 1.1)), false);
   burst(pr.x, pr.y, '#ff8c2a', 18);
+  flashes.push({ x: pr.x, y: pr.y, life: 0.3 });
   sfx(90, 0.2, 'sawtooth', 0.06, -40);
 }
 
@@ -579,7 +672,7 @@ function nextLevel() {
 }
 
 function revealMap() {
-  const ptx = Math.floor(p.x / T), pty = Math.floor(p.y / T), R = 8;
+  const ptx = Math.floor(p.x / T), pty = Math.floor(p.y / T), R = Math.ceil(lightRadius() / T);
   for (let y = pty - R; y <= pty + R; y++) for (let x = ptx - R; x <= ptx + R; x++) {
     if (x < 0 || y < 0 || x >= MW || y >= MH || seen[y][x] || map[y][x] === 1) continue;
     if (Math.hypot(x - ptx, y - pty) > R) continue;
@@ -599,6 +692,16 @@ function update(dt) {
   updateMouse();
   hurt = Math.max(0, hurt - dt);
   stairMsgCd -= dt;
+  for (const f of flashes) f.life -= dt;
+  flashes = flashes.filter(f => f.life > 0);
+  if (ATMOSPHERE_SOUNDS && state.mode === 'play') {   // creepy sounds now and then
+    ambTimer -= dt;
+    if (ambTimer <= 0) {
+      ambTimer = rnd(9, 22);
+      sfx(rnd(50, 110), 1.4, 'sawtooth', 0.02, -25);
+      if (Math.random() < 0.4) sfx(rnd(900, 1400), 0.7, 'sine', 0.008, -500);
+    }
+  }
 
   if (state.mode === 'play') {
     updatePlayer(dt);
@@ -629,7 +732,9 @@ function update(dt) {
   for (const m of msgs) m.life -= dt;
   msgs = msgs.filter(m => m.life > 0);
 
-  if (p) { cam.x += (ix(p.x, p.y) - W / 2 - cam.x) * 0.2; cam.y += (iy(p.x, p.y) - H / 2 - cam.y) * 0.2; }
+  const cf = 1 - Math.exp(-dt * 12);
+  zoom += (zoomTarget - zoom) * cf;
+  if (p) { cam.x += (ix(p.x, p.y) - W / 2 - cam.x) * cf; cam.y += (iy(p.x, p.y) - H / 2 - cam.y) * cf; }
 }
 
 // ---------- drawing helpers ----------
@@ -665,8 +770,9 @@ function shadowIso(gx, gy, r) {
 }
 
 function tileRange(cx, cy) {
-  const c = [toWorld(cx - 80, cy - 60), toWorld(cx + W + 80, cy - 60),
-             toWorld(cx - 80, cy + H + WALL_H + 20), toWorld(cx + W + 80, cy + H + WALL_H + 20)];
+  const mx = cx + W / 2, my = cy + H / 2, zx = W / 2 / zoom + 80, zy = H / 2 / zoom;
+  const c = [toWorld(mx - zx, my - zy - 60), toWorld(mx + zx, my - zy - 60),
+             toWorld(mx - zx, my + zy + WALL_H + 20), toWorld(mx + zx, my + zy + WALL_H + 20)];
   let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
   for (const q of c) { minX = Math.min(minX, q.x); maxX = Math.max(maxX, q.x); minY = Math.min(minY, q.y); maxY = Math.max(maxY, q.y); }
   return { x0: Math.max(0, Math.floor(minX / T) - 1), x1: Math.min(MW - 1, Math.floor(maxX / T) + 1),
@@ -678,9 +784,9 @@ function drawWall(tx, ty, fade) {
   const A = pt(x0, y0), B = pt(x0 + T, y0), C = pt(x0 + T, y0 + T), D = pt(x0, y0 + T);
   const up = q => [q[0], q[1] - h];
   if (fade) ctx.globalAlpha = 0.35;
-  if (!solid(tx + 1, ty)) poly([B, C, up(C), up(B)], '#2a2431', 'rgba(0,0,0,0.45)');
-  if (!solid(tx, ty + 1)) poly([D, C, up(C), up(D)], '#383040', 'rgba(0,0,0,0.45)');
-  poly([up(A), up(B), up(C), up(D)], '#4f4659', 'rgba(0,0,0,0.35)');
+  if (!solid(tx + 1, ty)) poly([B, C, up(C), up(B)], '#1b1721', 'rgba(0,0,0,0.5)');
+  if (!solid(tx, ty + 1)) poly([D, C, up(C), up(D)], '#262030', 'rgba(0,0,0,0.5)');
+  poly([up(A), up(B), up(C), up(D)], '#383142', 'rgba(0,0,0,0.4)');
   ctx.globalAlpha = 1;
 }
 
@@ -855,9 +961,14 @@ function drawWorld(cx, cy) {
     if (!seen[y][x] || map[y][x] !== 0) continue;
     const px = x * T, py = y * T;
     poly([pt(px, py), pt(px + T, py), pt(px + T, py + T), pt(px, py + T)],
-         ((x * 7 + y * 13) % 5 === 0) ? '#3d3643' : ((x + y) % 2 ? '#352f3c' : '#39333f'), 'rgba(0,0,0,0.28)');
+         ((x * 7 + y * 13) % 5 === 0) ? '#2f2a35' : ((x + y) % 2 ? '#29252f' : '#2c2832'), 'rgba(0,0,0,0.35)');
   }
   drawStairs();
+  if (p.mark && p.mark.life > 0) {                 // little ring where you clicked
+    const al = p.mark.life / 0.6, rr = 6 + (1 - al) * 14;
+    ctx.strokeStyle = 'rgba(255,230,120,' + al + ')'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(ix(p.mark.x, p.mark.y), iy(p.mark.x, p.mark.y), rr, rr * 0.5, 0, 0, PI2); ctx.stroke();
+  }
 
   const list = [];
   const playing = state.mode === 'play', pd = p.x + p.y;
@@ -872,8 +983,10 @@ function drawWorld(cx, cy) {
     list.push({ d: d.x + d.y, f: () => drawDrop(d) });
   }
   for (const e of enemies) {
-    if (e.dead || dist(e, p) > 600 || !los(p, e)) continue;
-    list.push({ d: e.x + e.y, f: () => drawEnemy(e) });
+    const dd = dist(e, p), lr = lightRadius();
+    if (e.dead || dd > lr || !los(p, e)) continue;
+    const al = Math.max(0, Math.min(1, (lr - dd) / (lr * 0.25)));      // fade in at the edge of the light
+    list.push({ d: e.x + e.y, f: () => { ctx.globalAlpha = al; drawEnemy(e); ctx.globalAlpha = 1; } });
   }
   if (playing) list.push({ d: pd, f: drawPlayer });
   for (const pr of projs) list.push({ d: pr.x + pr.y, f: () => drawProj(pr) });
@@ -882,16 +995,94 @@ function drawWorld(cx, cy) {
   drawParts();
 }
 
-function darkness(cx, cy) {
-  const sx0 = ix(p.x, p.y) - cx, sy0 = iy(p.x, p.y) - cy - 10, r = 430 + Math.sin(time * 6) * 6;
-  ctx.save();
-  ctx.translate(sx0, sy0);
-  ctx.scale(1, 0.6);
-  const g = ctx.createRadialGradient(0, 0, 70, 0, 0, r);
-  g.addColorStop(0, 'rgba(0,0,0,0)');
-  g.addColorStop(1, 'rgba(0,0,0,0.9)');
-  ctx.fillStyle = g; ctx.fillRect(-W * 3, -H * 4, W * 6, H * 8);
+// ---------- lighting ----------
+// How far your torch reaches, in world pixels. Gear with Light Radius helps; deeper levels are darker.
+function lightRadius() {
+  const flicker = 1 + Math.sin(time * 9) * 0.015 + Math.sin(time * 23.7) * 0.01;
+  return BASE_LIGHT * (1 + p.light / 100) * Math.max(0.7, 1 - LIGHT_DEPTH_LOSS * (depth - 1)) * flicker;
+}
+
+let lightCv = null, lightCtx = null;
+
+function screenPos(cx, cy, wx, wy) {
+  return { x: (ix(wx, wy) - cx - W / 2) * zoom + W / 2, y: (iy(wx, wy) - cy - H / 2) * zoom + H / 2 };
+}
+
+// Cuts a soft hole in the darkness. A circle on the floor looks like a 2:1 oval in this view.
+function punchLight(L, cx, cy, wx, wy, R, power) {
+  const sp = screenPos(cx, cy, wx, wy), rs = R * 1.131;
+  L.save(); L.translate(sp.x, sp.y); L.scale(zoom, zoom * 0.5);
+  const g = L.createRadialGradient(0, 0, 0, 0, 0, rs);
+  g.addColorStop(0, 'rgba(0,0,0,' + power + ')');
+  g.addColorStop(0.3, 'rgba(0,0,0,' + power * 0.96 + ')');
+  g.addColorStop(0.6, 'rgba(0,0,0,' + power * 0.6 + ')');
+  g.addColorStop(0.82, 'rgba(0,0,0,' + power * 0.2 + ')');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  L.fillStyle = g; L.fillRect(-rs, -rs, rs * 2, rs * 2);
+  L.restore();
+}
+
+// Adds a warm orange tint to the lit area.
+function warmGlow(cx, cy, wx, wy, R, rgb, a) {
+  const sp = screenPos(cx, cy, wx, wy), rs = R * 1.131;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  ctx.translate(sp.x, sp.y); ctx.scale(zoom, zoom * 0.5);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rs);
+  g.addColorStop(0, 'rgba(' + rgb + ',' + a + ')');
+  g.addColorStop(1, 'rgba(' + rgb + ',0)');
+  ctx.fillStyle = g; ctx.fillRect(-rs, -rs, rs * 2, rs * 2);
   ctx.restore();
+}
+
+function darkness(cx, cy) {
+  if (!lightCv || lightCv.width !== W || lightCv.height !== H) {
+    lightCv = document.createElement('canvas'); lightCv.width = W; lightCv.height = H;
+    lightCtx = lightCv.getContext('2d');
+  }
+  const L = lightCtx, R = lightRadius();
+  L.globalCompositeOperation = 'source-over';
+  L.clearRect(0, 0, W, H);
+  L.fillStyle = 'rgba(3,2,8,' + DARKNESS + ')';
+  L.fillRect(0, 0, W, H);
+  L.globalCompositeOperation = 'destination-out';
+  punchLight(L, cx, cy, p.x, p.y, R, 1);
+  for (const pr of projs) if (pr.fire) punchLight(L, cx, cy, pr.x, pr.y, 120, 0.9);
+  for (const f of flashes) punchLight(L, cx, cy, f.x, f.y, f.big ? 230 : 150, f.life / 0.3);
+  L.globalCompositeOperation = 'source-over';
+
+  warmGlow(cx, cy, p.x, p.y, R * 0.9, '255,150,60', 0.14);
+  for (const pr of projs) if (pr.fire) warmGlow(cx, cy, pr.x, pr.y, 120, '255,140,40', 0.3);
+  for (const f of flashes) warmGlow(cx, cy, f.x, f.y, f.big ? 200 : 130, '255,200,120', 0.25 * f.life / 0.3);
+  ctx.drawImage(lightCv, 0, 0);
+}
+
+// Monsters that have noticed you show glowing eyes in the dark beyond your light.
+function drawDarkEyes(cx, cy) {
+  const lr = lightRadius();
+  ctx.save(); applyView(cx, cy);
+  for (const e of enemies) {
+    if (e.dead || !e.aggro) continue;
+    const d = dist(e, p);
+    if (d <= lr * 0.9 || d > lr + 320 || !los(p, e)) continue;
+    const gx = ix(e.x, e.y), gy = iy(e.x, e.y) - e.r * 1.2 - (e.type === 'bat' ? 16 : 0), sp = Math.max(2.5, e.r * 0.3);
+    ctx.globalAlpha = Math.max(0, Math.min(1, (d - lr * 0.9) / (lr * 0.2))) * (0.65 + 0.35 * Math.sin(time * 5 + e.x));
+    ctx.fillStyle = 'rgba(255,40,40,0.25)'; circle(gx - sp, gy, 5); circle(gx + sp, gy, 5);
+    ctx.fillStyle = '#ff3030'; circle(gx - sp, gy, 1.8); circle(gx + sp, gy, 1.8);
+  }
+  ctx.globalAlpha = 1; ctx.restore();
+}
+
+// Dark edges on the screen, and a red heartbeat glow when you are badly hurt.
+function vignette() {
+  const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.78);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.65)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  if (state.mode === 'play' && p.hp / p.maxhp < 0.3) {
+    const pulse = 0.5 + 0.5 * Math.sin(time * 6);
+    const r = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.25, W / 2, H / 2, Math.max(W, H) * 0.7);
+    r.addColorStop(0, 'rgba(120,0,0,0)'); r.addColorStop(1, 'rgba(120,0,0,' + (0.15 + 0.25 * pulse) + ')');
+    ctx.fillStyle = r; ctx.fillRect(0, 0, W, H);
+  }
 }
 
 // ---------- HUD ----------
@@ -959,7 +1150,7 @@ function hud() {
   ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(mx - 2, my - 2, MW * sc + 4, MH * sc + 4);
   for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) if (seen[y][x] && map[y][x] === 0) { ctx.fillStyle = '#6a6275'; ctx.fillRect(mx + x * sc, my + y * sc, sc, sc); }
   if (seen[Math.floor(stairs.y / T)][Math.floor(stairs.x / T)]) { ctx.fillStyle = '#c08cff'; ctx.fillRect(mx + Math.floor(stairs.x / T) * sc - 1, my + Math.floor(stairs.y / T) * sc - 1, 4, 4); }
-  for (const e of enemies) if (dist(e, p) < 330 && los(p, e)) { ctx.fillStyle = '#f33'; ctx.fillRect(mx + Math.floor(e.x / T) * sc, my + Math.floor(e.y / T) * sc, 3, 3); }
+  for (const e of enemies) if (dist(e, p) < lightRadius() && los(p, e)) { ctx.fillStyle = '#f33'; ctx.fillRect(mx + Math.floor(e.x / T) * sc, my + Math.floor(e.y / T) * sc, 3, 3); }
   ctx.fillStyle = '#ffe14a'; ctx.fillRect(mx + Math.floor(p.x / T) * sc - 1, my + Math.floor(p.y / T) * sc - 1, 4, 4);
   ctx.strokeStyle = '#6b5a3a'; ctx.lineWidth = 1; ctx.strokeRect(mx - 2, my - 2, MW * sc + 4, MH * sc + 4);
 }
@@ -1003,7 +1194,7 @@ function drawInv() {
     itemBox(b, it, hov);
     if (hov && it) tip = it;
   }
-  const st = [['Damage', Math.round(p.dmg)], ['Armor', p.armor], ['Crit chance', p.crit + '%'], ['Life steal', p.steal + '%'], ['Attack speed', '+' + p.spd + '%'], ['Max life', p.maxhp], ['Max mana', p.maxmp], ['Gold', p.gold]];
+  const st = [['Damage', Math.round(p.dmg)], ['Armor', p.armor], ['Crit chance', p.crit + '%'], ['Life steal', p.steal + '%'], ['Attack speed', '+' + p.spd + '%'], ['Max life', p.maxhp], ['Max mana', p.maxmp], ['Light radius', (p.light >= 0 ? '+' : '') + p.light + '%'], ['Gold', p.gold]];
   for (let i = 0; i < st.length; i++) { txt(st[i][0], L.x + 130, L.y + 95 + i * 24, '#a89f8a', 14); txt(String(st[i][1]), L.x + 270, L.y + 95 + i * 24, '#fff', 14, 'right'); }
   if (tip) {
     const lines = itemLines(tip);
@@ -1027,11 +1218,11 @@ function drawTitle() {
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
   const glow = 0.6 + Math.sin(performance.now() / 400) * 0.2;
   txt('DUNGEON GAME', W / 2, H / 2 - 150, 'rgba(255,150,60,' + glow + ')', 56, 'center');
-  txt('Descend. Slay. Loot. Survive.', W / 2, H / 2 - 105, '#a89f8a', 20, 'center');
+  txt('Your torch is all you have. Do not stray far.', W / 2, H / 2 - 105, '#a89f8a', 20, 'center');
   const lines = [
     'Left-click ground: walk        Left-click monster: attack (hold to keep going)',
     'Right-click or Q: Fireball (aims at your mouse)        E: Frost Nova (hits everything close)',
-    '1: Life potion        2: Mana potion        I: Inventory        B / N: buy potions',
+    '1: Life potion        2: Mana potion        I: Inventory        B / N: buy potions        Mouse wheel: zoom        M: sound on/off',
     'Walk over loot to pick it up. Find the stairs to go deeper. Every 3rd level has a boss.'
   ];
   lines.forEach((l, i) => txt(l, W / 2, H / 2 - 40 + i * 28, '#d8cfb8', 16, 'center'));
@@ -1045,14 +1236,22 @@ function drawDead() {
   if (deadTimer <= 0) txt('Click to try again', W / 2, H / 2 + 70, '#ffd24a', 24, 'center');
 }
 
+function applyView(cx, cy) {
+  ctx.translate(W / 2, H / 2);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W / 2 - cx, -H / 2 - cy);
+}
+
 function draw() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   if (state.mode === 'title') { drawTitle(); return; }
   const cx = Math.round(cam.x), cy = Math.round(cam.y);
-  ctx.save(); ctx.translate(-cx, -cy); drawWorld(cx, cy); ctx.restore();
+  ctx.save(); applyView(cx, cy); drawWorld(cx, cy); ctx.restore();
   darkness(cx, cy);
-  ctx.save(); ctx.translate(-cx, -cy); drawFloats(); ctx.restore();
+  drawDarkEyes(cx, cy);
+  vignette();
+  ctx.save(); applyView(cx, cy); drawFloats(); ctx.restore();
   hud();
   if (invOpen) drawInv();
   if (state.mode === 'dead') drawDead();
@@ -1070,10 +1269,15 @@ cv.addEventListener('mousedown', e => {
   if (e.button === 0) {
     mouse.down = true;
     if (hoverEnemy) p.target = hoverEnemy;
-    else { p.target = null; moveTo(mouse.wx, mouse.wy); p.repath = 0.12; }
+    else { p.target = null; moveTo(mouse.wx, mouse.wy); p.repath = 0.06; p.mark = { x: mouse.wx, y: mouse.wy, life: 0.6 }; }
   } else if (e.button === 2) castFire();
 });
 addEventListener('mouseup', () => { mouse.down = false; });
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  zoomTarget *= e.deltaY < 0 ? 1.12 : 1 / 1.12;          // wheel up = zoom in, wheel down = zoom out
+  zoomTarget = Math.max(0.5, Math.min(2, zoomTarget));    // limits: change 0.5 and 2 if you like
+}, { passive: false });
 
 function invClick(btn) {
   const L = invLayout();
@@ -1108,6 +1312,7 @@ addEventListener('keydown', e => {
   else if (k === '2') usePot('mp');
   else if (k === 'b') buy('hp');
   else if (k === 'n') buy('mp');
+  else if (k === 'm') toggleSound();
 });
 
 // ---------- main loop ----------
